@@ -1,0 +1,152 @@
+name: Instaladores internos
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit del fork validado
+        required: true
+        type: string
+      target:
+        description: Equipo destino
+        required: true
+        default: win-x64
+        type: choice
+        options: [win-x64, mac-arm64, mac-x64]
+      build_version:
+        description: Versión común de los instaladores (vacío usa numeración automática)
+        required: false
+        type: string
+      enable_updates:
+        description: Activar actualizaciones (requiere repositorio de instaladores público)
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ${{ inputs.target == 'win-x64' && 'windows-latest' || inputs.target == 'mac-x64' && 'macos-15-intel' || 'macos-15' }}
+    timeout-minutes: 90
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_DESKTOP_BUILD_VERSION: ${{ inputs.build_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CarlosVP120/deepseek-harness
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.7.0'
+      - name: Configuración interna sin credenciales
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          ENABLE_UPDATES: ${{ inputs.enable_updates }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$TARGET" = win-x64 ]; then
+            CONFIG=apps/desktop/.env.windows
+            printf 'DSH_DESKTOP_APP_ID=mx.fiscalcfdi.ai\n' > "$CONFIG"
+          else
+            CONFIG=apps/desktop/.env.macos
+            printf 'DSH_DESKTOP_APP_ID=mx.fiscalcfdi.ai\n' > "$CONFIG"
+          fi
+          if [ "$ENABLE_UPDATES" = true ]; then
+            test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = false || { echo 'El canal sin login requiere instaladores públicos'; exit 1; }
+            printf 'DSH_DESKTOP_INTERNAL_UPDATE_REPOSITORY=%s\n' "$GITHUB_REPOSITORY" >> "$CONFIG"
+          fi
+      - name: Firma autofirmada de Mac
+        if: inputs.target != 'win-x64'
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.MAC_CS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MAC_CS_P12_PASSWORD }}
+        run: |
+          test -n "$P12_BASE64" && test -n "$P12_PASSWORD"
+          umask 077
+          KEYCHAIN="$RUNNER_TEMP/fiscalcfdi-signing.keychain-db"
+          KC_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KC_PASSWORD"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/fiscalcfdi-identity.p12"
+          security create-keychain -p "$KC_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/fiscalcfdi-identity.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Confianza para codeSign solo en el corredor efímero.
+          security find-certificate -c 'FiscalCFDI AI Self-Signed' -p "$KEYCHAIN" > "$RUNNER_TEMP/fiscalcfdi-signing.crt"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/fiscalcfdi-signing.crt"
+          export FISCALCFDI_SIGNING_KEYCHAIN="$KEYCHAIN"
+          python3 - <<'PY'
+          import os, shlex, subprocess
+          existing = shlex.split(subprocess.check_output(['security', 'list-keychains', '-d', 'user'], text=True))
+          subprocess.run(['security', 'list-keychains', '-d', 'user', '-s', os.environ['FISCALCFDI_SIGNING_KEYCHAIN'], *existing], check=True)
+          PY
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          cp /bin/echo "$RUNNER_TEMP/fiscalcfdi-signing-probe"
+          codesign --force --sign 'FiscalCFDI AI Self-Signed' --keychain "$KEYCHAIN" --timestamp=none --identifier mx.fiscalcfdi.ai "$RUNNER_TEMP/fiscalcfdi-signing-probe"
+          codesign --verify --strict "$RUNNER_TEMP/fiscalcfdi-signing-probe"
+          printf 'DSH_DESKTOP_MACOS_LOCAL_SIGNING_IDENTITY="FiscalCFDI AI Self-Signed"\nDSH_DESKTOP_MACOS_LOCAL_SIGNING_KEYCHAIN=%s\n' "$KEYCHAIN" >> apps/desktop/.env.macos
+          rm "$RUNNER_TEMP/fiscalcfdi-identity.p12"
+      - name: Dependencias
+        run: pnpm install --frozen-lockfile
+      - name: Validar interfaz Windows en los tres idiomas
+        if: inputs.target == 'win-x64'
+        run: pnpm --dir apps/desktop run test:installer
+      - name: Conservar capturas de la interfaz Windows
+        if: always() && inputs.target == 'win-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fiscalcfdi-ai-windows-ui-${{ github.run_number }}
+          path: |
+            apps/desktop/.desktop-build/installer-tests/**/*.png
+            apps/desktop/.desktop-build/installer-tests/**/results.json
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 30
+      - name: Construir y comprobar el runtime instalado
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          BUILD_ARGS=()
+          if [ -n "$DSH_DESKTOP_BUILD_VERSION" ]; then
+            BUILD_ARGS=(--build-version "$DSH_DESKTOP_BUILD_VERSION")
+          fi
+          pnpm --dir apps/desktop run "package:${TARGET//-/:}:unsigned" "${BUILD_ARGS[@]}"
+      - name: Validar versión de los instaladores
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { createRequire } from 'node:module';
+          const require = createRequire(resolve('apps/desktop/package.json'));
+          const { load } = require('js-yaml');
+          const target = process.env.TARGET;
+          const filename = target.startsWith('mac-') ? 'nightly-mac.yml' : 'nightly.yml';
+          const metadata = load(readFileSync(`apps/desktop/.desktop-build/targets/${target}/unsigned-artifacts/${filename}`, 'utf8'));
+          const expected = process.env.DSH_DESKTOP_BUILD_VERSION;
+          if (expected && metadata.version !== expected) throw new Error(`Installer version ${metadata.version} differs from ${expected}`);
+          if (!metadata.files.length || metadata.files.some(file => !file.url.includes(`-${metadata.version}-`))) throw new Error('Installer filenames and update metadata differ');
+          console.log(`Verified installer version: ${metadata.version}`);
+          JS
+      - name: Conservar instaladores
+        uses: actions/upload-artifact@v4
+        with:
+          name: fiscalcfdi-ai-${{ inputs.target }}-${{ github.run_number }}
+          path: |
+            apps/desktop/.desktop-build/targets/${{ inputs.target }}/unsigned-artifacts/*.exe
+            apps/desktop/.desktop-build/targets/${{ inputs.target }}/unsigned-artifacts/*.dmg
+            apps/desktop/.desktop-build/targets/${{ inputs.target }}/unsigned-artifacts/*.zip
+            apps/desktop/.desktop-build/targets/${{ inputs.target }}/unsigned-artifacts/*.yml
+            apps/desktop/.desktop-build/targets/${{ inputs.target }}/unsigned-artifacts/*.blockmap
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
