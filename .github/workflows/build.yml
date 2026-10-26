@@ -20,6 +20,10 @@ on:
         description: Activar actualizaciones (requiere repositorio de instaladores público)
         type: boolean
         default: true
+      motor_ref:
+        description: Commit del motor contable que lleva el instalador
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
@@ -35,6 +39,23 @@ jobs:
           repository: CarlosVP120/deepseek-harness
           ref: ${{ inputs.source_ref }}
           persist-credentials: false
+      # Motor contable: repositorio privado, leído con una llave de solo lectura y fuera del árbol del fork.
+      - uses: actions/checkout@v4
+        with:
+          repository: CarlosVP120/fiscalcfdi-ai-motor
+          ref: ${{ inputs.motor_ref }}
+          path: fiscalcfdi-motor
+          ssh-key: ${{ secrets.MOTOR_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Ubicar el motor contable
+        shell: bash
+        run: |
+          mv fiscalcfdi-motor "$RUNNER_TEMP/fiscalcfdi-motor"
+          echo "FISCALCFDI_ENGINE_SOURCE=$RUNNER_TEMP/fiscalcfdi-motor" >> "$GITHUB_ENV"
+      # Python solo para descargar las librerías del motor para el equipo destino; el instalador lleva su propio Python.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
