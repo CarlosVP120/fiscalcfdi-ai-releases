@@ -1,0 +1,58 @@
+name: Publicar versión
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Etiqueta de la versión (v0.2.1-alpha.1.AAAAMMDD.N)
+        required: true
+        type: string
+      title:
+        description: Título de la versión
+        required: true
+        type: string
+      windows_run:
+        description: Ejecución de «Instaladores internos» con el instalador de Windows
+        required: true
+        type: string
+      mac_run:
+        description: Ejecución de «Instaladores internos» con el instalador de Mac Apple Silicon
+        required: true
+        type: string
+      notes:
+        description: Notas de la versión (Markdown)
+        required: true
+        type: string
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Los instaladores pasan de las ejecuciones de compilación a la versión sin salir de GitHub.
+      - name: Publicar
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          WIN_RUN: ${{ inputs.windows_run }}
+          MAC_RUN: ${{ inputs.mac_run }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          gh run download "$WIN_RUN" -R "$GITHUB_REPOSITORY" -p 'fiscalcfdi-ai-win-x64-*' -D win
+          gh run download "$MAC_RUN" -R "$GITHUB_REPOSITORY" -p 'fiscalcfdi-ai-mac-arm64-*' -D mac
+          VERSION="${TAG#v}"
+          FILES=()
+          for f in win/*/fiscalcfdi-ai-"$VERSION"-win-x64-unsigned.exe win/*/fiscalcfdi-ai-"$VERSION"-win-x64-unsigned.exe.blockmap win/*/nightly.yml \
+                   mac/*/fiscalcfdi-ai-"$VERSION"-mac-arm64-unsigned.dmg mac/*/fiscalcfdi-ai-"$VERSION"-mac-arm64-unsigned.zip \
+                   mac/*/fiscalcfdi-ai-"$VERSION"-mac-arm64-unsigned.zip.blockmap mac/*/nightly-mac.yml; do
+            test -f "$f" || { echo "Falta $f"; ls -R win mac; exit 1; }
+            FILES+=("$f")
+          done
+          grep -q "$VERSION" win/*/nightly.yml && grep -q "$VERSION" mac/*/nightly-mac.yml
+          printf '%s\n' "$NOTES" > notes.md
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TITLE" --notes-file notes.md --latest "${FILES[@]}"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"'
