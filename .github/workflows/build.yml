@@ -115,6 +115,11 @@ jobs:
           rm "$RUNNER_TEMP/fiscalcfdi-identity.p12"
       - name: Dependencias
         run: pnpm install --frozen-lockfile
+      # Claude con suscripción: instala Claude Code con el instalador oficial y comprueba que la app lo arranca
+      # (sin sesión, debe responder que falta conectar la cuenta). Falla antes de empaquetar.
+      - name: Comprobar Claude Code en Windows
+        if: inputs.target == 'win-x64'
+        run: pnpm exec tsx packages/fiscalcfdi/tools/scripts/claude-code-smoke.ts --install
       - name: Validar interfaz Windows en los tres idiomas
         if: inputs.target == 'win-x64'
         run: pnpm --dir apps/desktop run test:installer
